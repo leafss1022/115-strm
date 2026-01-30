@@ -1,13 +1,13 @@
 [license]: /LICENSE
-[license-badge]: https://img.shields.io/github/license/Akimio521/AutoFilm?style=flat-square&a=1
-[prs]: https://github.com/uwang/115-strm
+[license-badge]: https://img.shields.io/github/license/leafss1022/115-strm?style=flat-square&a=1
+[prs]: https://github.com/leafss1022/115-strm
 [prs-badge]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square
-[issues]: https://github.com/uwang/115-strm/issues/new
+[issues]: https://github.com/leafss1022/115-strm/issues/new
 [issues-badge]: https://img.shields.io/badge/Issues-welcome-brightgreen.svg?style=flat-square
-[release]: https://github.com/uwang/115-strm/releases/latest
-[release-badge]: https://img.shields.io/github/v/release/uwang/115-strm?style=flat-square
-[docker]: https://hub.docker.com/r/uwang/115-strm
-[docker-badge]: https://img.shields.io/docker/pulls/uwang/115-strm?color=%2348BB78&logo=docker&label=pulls
+[release]: https://github.com/leafss1022/115-strm/releases/latest
+[release-badge]: https://img.shields.io/github/v/release/leafss1022/115-strm?style=flat-square
+[docker]: https://hub.docker.com/r/leafss1022/115-strm
+[docker-badge]: https://img.shields.io/docker/pulls/leafss1022/115-strm?color=%2348BB78&logo=docker&label=pulls
 
 # 115-strm
 
@@ -31,7 +31,7 @@
 ```yml
 services:
     alpine:
-        image: ghcr.io/uwang/115-strm:latest
+        image: leafss1022/115-strm:latest
         container_name: alist-strm
         environment:
           - ALIST_HOST=192.168.1.100

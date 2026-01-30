@@ -1,6 +1,6 @@
 services:
     alpine:
-        image: ghcr.io/uwang/115-strm:latest
+        image: leafss1022/115-strm:latest
         container_name: alist-strm
         environment:
           - TZ=Asia/Shanghai
