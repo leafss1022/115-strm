@@ -1,0 +1,85 @@
+# 优化的 docker-compose.yml 配置
+# 包含健康检查、资源限制、日志管理等优化
+
+services:
+    alpine:
+        # 使用你自己的镜像名称
+        image: leafss1022/115-strm:latest
+
+        container_name: alist-strm
+
+        # 环境变量
+        environment:
+          # 基础配置
+          - TZ=Asia/Shanghai
+          - LOG_LEVEL=2  # 0=ERROR, 1=WARNING, 2=INFO, 3=DEBUG
+
+          # Alist 配置
+          - ALIST_HOST=192.168.1.100
+          - ALIST_PORT=5244
+          - ALIST_115_MOUNT_PATH=/115
+
+          # 115 网盘目录树配置
+          - ALIST_115_TREE_FILE=/目录树.txt
+          - EXCLUDE_OPTION=1
+          - UPDATE_EXISTING=0
+          - DELETE_ABSENT=1
+
+          # 可选：目录树探测（需要启用 guest 用户）
+          - ALIST_115_TREE_FILE_FOR_GUEST=/115/目录树.txt
+
+          # 媒体文件扩展名
+          - MEDIA_EXTENSIONS=mp3,flac,wav,aac,ogg,wma,alac,m4a,aiff,ape,dsf,dff,wv,pcm,tta,mp4,mkv,avi,mov,wmv,flv,webm,vob,mpg,mpeg,iso
+
+          # 定时任务配置（可选）
+          - CRON_SCHEDULE=0 * * * *  # 默认每小时执行一次
+
+        # 数据卷挂载
+        volumes:
+            # STRM 文件存储路径
+            - '/path/to/115-strm/data:/data'
+
+            # 日志文件存储（可选，用于持久化日志）
+            - '/path/to/115-strm/logs:/app/logs'
+
+        # 资源限制（可选）
+        deploy:
+            resources:
+                limits:
+                    cpus: '1.0'
+                    memory: 512M
+                reservations:
+                    cpus: '0.25'
+                    memory: 128M
+
+        # 重启策略
+        restart: 'unless-stopped'
+
+        # 健康检查
+        healthcheck:
+            test: ["CMD", "pgrep", "-f", "crond"]
+            interval: 5m
+            timeout: 30s
+            retries: 3
+            start_period: 30s
+
+        # 网络配置（可选）
+        networks:
+            - alist-network
+
+        # 标签
+        labels:
+          - "com.115-strm.description=115 STRM Generator"
+          - "com.115-strm.version=2.0.0"
+
+# 网络配置（可选）
+networks:
+    alist-network:
+        driver: bridge
+
+# 数据卷配置（可选）
+volumes:
+    data:
+        driver: local
+    logs:
+        driver: local

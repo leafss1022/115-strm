@@ -1,0 +1,77 @@
+# 优化的 Dockerfile - 多阶段构建 + 健康检查 + 日志管理
+
+# ========================================
+# 构建阶段
+# ========================================
+FROM python:3.11-alpine AS builder
+
+WORKDIR /app
+
+# 只复制依赖文件，利用层缓存
+COPY ./src/requirements.txt .
+
+# 安装依赖到用户目录
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# ========================================
+# 运行阶段
+# ========================================
+FROM python:3.11-alpine
+
+# 元数据
+LABEL maintainer="leafss1022"
+LABEL version="2.0.0"
+LABEL description="115 STRM Generator with Alist - Optimized Version"
+LABEL org.opencontainers.image.source="https://github.com/leafss1022/115-strm"
+
+# 安装运行时依赖
+RUN apk update && \
+    apk add --no-cache \
+    bash \
+    curl \
+    dcron \
+    tini \
+    logrotate && \
+    rm -rf /var/cache/apk/*
+
+# 配置 Python 路径
+ENV PATH=/root/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    LOG_LEVEL=1
+
+# 创建必要的目录
+RUN mkdir -p /app/logs /data && \
+    chmod 777 /app/logs /data
+
+# 配置日志轮转
+RUN echo '/app/logs/*.log {' > /etc/logrotate.d/115-strm && \
+    echo '    daily' >> /etc/logrotate.d/115-strm && \
+    echo '    rotate 7' >> /etc/logrotate.d/115-strm && \
+    echo '    compress' >> /etc/logrotate.d/115-strm && \
+    echo '    delaycompress' >> /etc/logrotate.d/115-strm && \
+    echo '    missingok' >> /etc/logrotate.d/115-strm && \
+    echo '    notifempty' >> /etc/logrotate.d/115-strm && \
+    echo '    create 644 root root' >> /etc/logrotate.d/115-strm && \
+    echo '}' >> /etc/logrotate.d/115-strm
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制依赖和源代码
+COPY --from=builder /root/.local /root/.local
+COPY ./src/ .
+
+# 设置执行权限
+RUN chmod +x main.py
+
+# 健康检查
+HEALTHCHECK --interval=5m --timeout=30s --start-period=30s --retries=3 \
+    CMD pgrep -f "crond" > /dev/null && \
+    test -f /app/logs/115-strm.log || exit 1
+
+# 定时任务 - 支持自定义 CRON_SCHEDULE
+ENV CRON_SCHEDULE="0 * * * *"
+RUN echo "${CRON_SCHEDULE} sleep $((RANDOM % 60)) && /usr/sbin/logrotate /etc/logrotate.d/115-strm && /root/.local/bin/python /app/main.py >> /proc/1/fd/1 2>&1" | crontab -
+
+# 启动日志轮转 + crond
+CMD ["/sbin/tini", "--", "sh", "-c", "crond -f -l ${LOG_LEVEL}"]

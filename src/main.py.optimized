@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+# -*- coding:utf-8 -*-
+"""
+优化版 115 STRM 生成器
+优化内容：
+1. 使用 logging 模块替代 print
+2. 添加重试机制
+3. 添加配置验证
+4. 添加进度显示
+5. 改进异常处理
+6. 添加执行统计
+"""
+
+import os
+import sys
+import json
+import urllib.parse
+import hashlib
+import time
+from datetime import datetime
+from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Set, Tuple, Optional
+
+import requests
+import chardet
+
+# ========================================
+# 日志配置
+# ========================================
+import logging
+
+def setup_logging():
+    """配置日志系统"""
+    log_level = os.getenv('LOG_LEVEL', '1')
+    level_map = {
+        '0': logging.ERROR,
+        '1': logging.WARNING,
+        '2': logging.INFO,
+        '3': logging.DEBUG
+    }
+    level = level_map.get(log_level, logging.INFO)
+
+    # 创建日志目录
+    os.makedirs('/app/logs', exist_ok=True)
+
+    # 配置日志格式
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    date_format = '%Y-%m-%d %H:%M:%S'
+
+    # 配置 handlers
+    handlers = [
+        logging.FileHandler('/app/logs/115-strm.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+
+    logging.basicConfig(
+        level=level,
+        format=log_format,
+        datefmt=date_format,
+        handlers=handlers
+    )
+
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
+
+# ========================================
+# 配置验证
+# ========================================
+def validate_config() -> dict:
+    """验证环境变量配置"""
+    config = {
+        'ALIST_HOST': os.getenv('ALIST_HOST', '127.0.0.1'),
+        'ALIST_PORT': os.getenv('ALIST_PORT', '5244'),
+        'ALIST_115_MOUNT_PATH': os.getenv('ALIST_115_MOUNT_PATH', '/115'),
+        'ALIST_115_TREE_FILE': os.getenv('ALIST_115_TREE_FILE', '/目录树.txt'),
+        'STRM_SAVE_PATH': os.getenv('STRM_SAVE_PATH', '/data'),
+        'EXCLUDE_OPTION': int(os.getenv('EXCLUDE_OPTION', '1')),
+        'UPDATE_EXISTING': int(os.getenv('UPDATE_EXISTING', '0')),
+        'DELETE_ABSENT': int(os.getenv('DELETE_ABSENT', '1')),
+        'ALIST_115_TREE_FILE_FOR_GUEST': os.getenv('ALIST_115_TREE_FILE_FOR_GUEST', ''),
+        'MEDIA_EXTENSIONS': os.getenv('MEDIA_EXTENSIONS', ''),
+    }
+
+    # 验证必要的环境变量
+    required = ['ALIST_HOST', 'ALIST_PORT', 'ALIST_115_MOUNT_PATH', 'ALIST_115_TREE_FILE']
+    missing = [k for k in required if not config[k]]
+
+    if missing:
+        logger.error(f"缺少必要的环境变量: {', '.join(missing)}")
+        sys.exit(1)
+
+    # 验证端口
+    try:
+        port = int(config['ALIST_PORT'])
+        if not 1 <= port <= 65535:
+            raise ValueError(f"端口 {port} 超出有效范围 (1-65535)")
+    except ValueError as e:
+        logger.error(f"ALIST_PORT 配置错误: {e}")
+        sys.exit(1)
+
+    # 验证 EXCLUDE_OPTION
+    if config['EXCLUDE_OPTION'] < 0:
+        logger.warning("EXCLUDE_OPTION 小于 0，已重置为 0")
+        config['EXCLUDE_OPTION'] = 0
+
+    logger.info(f"配置验证通过: ALIST_URL=http://{config['ALIST_HOST']}:{config['ALIST_PORT']}")
+
+    return config
+
+CONFIG = validate_config()
+
+# ========================================
+# 重试装饰器
+# ========================================
+def retry(max_retries: int = 3, delay: int = 2, backoff: float = 2.0):
+    """重试装饰器"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            current_delay = delay
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logger.error(f"重试 {max_retries} 次后仍然失败: {e}")
+                        raise
+                    logger.warning(f"尝试 {attempt + 1}/{max_retries} 失败: {e}，{current_delay} 秒后重试...")
+                    time.sleep(current_delay)
+                    current_delay *= backoff
+            return None
+        return wrapper
+    return decorator
+
+# ========================================
+# 工具函数
+# ========================================
+def get_media_extensions() -> Set[str]:
+    """获取媒体扩展名集合"""
+    default_extensions = {
+        "mp3", "flac", "wav", "aac", "ogg", "wma", "alac", "m4a",
+        "aiff", "ape", "dsf", "dff", "wv", "pcm", "tta",
+        "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "vob",
+        "mpg", "mpeg", "iso", "img", "bin", "nrg", "cue"
+    }
+
+    env_extensions = CONFIG['MEDIA_EXTENSIONS']
+    if env_extensions:
+        return set(ext.strip().lower() for ext in env_extensions.split(",") if ext.strip())
+    return default_extensions
+
+def extract_filename_from_url(url: str) -> str:
+    """从 URL 提取文件名"""
+    return os.path.basename(urllib.parse.urlparse(url).path)
+
+def get_file_sha1(file_path: str) -> Optional[str]:
+    """计算文件的 SHA1 哈希值"""
+    try:
+        sha1 = hashlib.sha1()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha1.update(chunk)
+        return sha1.hexdigest()
+    except FileNotFoundError:
+        logger.error(f"文件不存在: {file_path}")
+    except Exception as e:
+        logger.error(f"计算 SHA1 失败: {e}")
+    return None
+
+# ========================================
+# API 请求
+# ========================================
+@retry(max_retries=3, delay=2)
+def fetch_file_info(api_url: str, file_path: str, page: int = 1,
+                    per_page: int = 0, refresh: bool = True) -> Optional[dict]:
+    """从 API 获取文件信息"""
+    payload = json.dumps({
+        "path": file_path,
+        "page": page,
+        "per_page": per_page,
+        "refresh": refresh
+    })
+    headers = {'Content-Type': 'application/json'}
+
+    try:
+        response = requests.post(api_url, headers=headers, data=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"请求失败: {e}")
+        raise
+
+def extract_modified_and_sha1(response_data: dict) -> Tuple[Optional[str], Optional[str]]:
+    """提取 modified 和 sha1"""
+    try:
+        modified = response_data['data']['modified']
+        sha1 = response_data['data']['hash_info']['sha1'].lower()
+
+        modified_dt = datetime.fromisoformat(modified)
+        formatted_modified = modified_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        return formatted_modified, sha1
+    except (KeyError, TypeError) as e:
+        logger.error(f"数据提取失败: {e}")
+        return None, None
+
+# ========================================
+# 文件下载
+# ========================================
+@retry(max_retries=3, delay=2)
+def download_with_redirects(url: str, output_file: str) -> None:
+    """下载文件，支持重定向"""
+    logger.info(f"开始下载目录树文件: {url}")
+
+    headers = {
+        "User-Agent": "curl/8.1.2",
+        "Cache-Control": "no-cache",
+        "Accept": "*/*",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=60)
+        response.raise_for_status()
+
+        # 显示下载进度
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+
+        with open(output_file, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    progress = (downloaded / total_size) * 100
+                    if downloaded % 100000 == 0:  # 每 100KB 显示一次
+                        logger.debug(f"下载进度: {progress:.1f}%")
+
+        logger.info(f"文件已下载: {output_file} ({downloaded} bytes)")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"下载失败: {e}")
+        raise
+
+# ========================================
+# 目录树处理
+# ========================================
+def detect_file_encoding(file_path: str) -> str:
+    """检测文件编码"""
+    try:
+        with open(file_path, 'rb') as f:
+            raw_data = f.read(10000)  # 读取前 10KB 进行检测
+        result = chardet.detect(raw_data)
+        encoding = result['encoding'] or 'utf-8'
+        logger.debug(f"检测到文件编码: {encoding}")
+        return encoding
+    except Exception as e:
+        logger.warning(f"编码检测失败，使用默认 UTF-8: {e}")
+        return 'utf-8'
+
+def parse_directory_tree(file_path: str, generated_file: str) -> None:
+    """解析目录树并生成新的目录文件"""
+    logger.info(f"开始解析目录树文件: {file_path}")
+
+    current_path_stack = []
+    encoding = detect_file_encoding(file_path)
+
+    line_count = 0
+    with open(file_path, 'r', encoding=encoding, errors='ignore') as fin, \
+         open(generated_file, 'w', encoding='utf-8') as fout:
+        for line in fin:
+            line = line.lstrip('\ufeff').strip()
+            if not line:
+                continue
+
+            line_depth = line.count('|')
+            item_name = line.split('|-')[-1].strip()
+            if not item_name:
+                continue
+
+            # 更新路径栈
+            while len(current_path_stack) > line_depth:
+                current_path_stack.pop()
+            if len(current_path_stack) == line_depth and current_path_stack:
+                current_path_stack.pop()
+            current_path_stack.append(item_name)
+
+            # 写入完整路径
+            full_path = '/' + '/'.join(current_path_stack)
+            fout.write(full_path + '\n')
+            line_count += 1
+
+    logger.info(f"目录树解析完成，共 {line_count} 条记录")
+
+# ========================================
+# STRM 文件生成（并发优化）
+# ========================================
+def write_strm_file(file_info: Tuple[str, str]) -> str:
+    """写入单个 STRM 文件"""
+    strm_file_path, full_url = file_info
+    with open(strm_file_path, 'w', encoding='utf-8') as strm_file:
+        strm_file.write(full_url)
+    return strm_file_path
+
+def generate_strm_files(directory_file: str, strm_path: str,
+                        alist_full_url: str, exclude_option: int) -> Set[str]:
+    """生成 .strm 文件，使用并发写入"""
+    logger.info(f"开始生成 STRM 文件，目标路径: {strm_path}")
+
+    os.makedirs(strm_path, exist_ok=True)
+    media_extensions = get_media_extensions()
+    generated_files = set()
+
+    # 收集所有需要生成的文件
+    file_tasks = []
+    with open(directory_file, 'r', encoding='utf-8') as file:
+        for line in file:
+            line = line.strip()
+            if line.count('/') < exclude_option + 1:
+                continue
+
+            adjusted_path = '/'.join(line.split('/')[exclude_option + 1:])
+            ext = adjusted_path.split('.')[-1].lower()
+
+            if ext in media_extensions:
+                encoded_path = urllib.parse.quote(adjusted_path)
+                full_url = f"{alist_full_url}/{encoded_path}"
+                strm_file_path = os.path.join(strm_path, adjusted_path + '.strm')
+
+                # 如果文件已存在且不更新，则跳过
+                if CONFIG['UPDATE_EXISTING'] == 0 and os.path.exists(strm_file_path):
+                    continue
+
+                os.makedirs(os.path.dirname(strm_file_path), exist_ok=True)
+                file_tasks.append((strm_file_path, full_url))
+
+    logger.info(f"需要生成 {len(file_tasks)} 个 STRM 文件")
+
+    # 并发写入文件
+    max_workers = min(10, len(file_tasks))
+    if max_workers > 0:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(write_strm_file, task): task for task in file_tasks}
+            completed = 0
+            for future in as_completed(futures):
+                strm_file_path = future.result()
+                generated_files.add(os.path.abspath(strm_file_path))
+                completed += 1
+                if completed % 100 == 0:
+                    logger.info(f"进度: {completed}/{len(file_tasks)}")
+
+    logger.info(f"STRM 文件生成完成，共生成 {len(generated_files)} 个文件")
+    return generated_files
+
+def delete_absent_files(strm_path: str, generated_files: Set[str]) -> int:
+    """删除目录树中不存在的 STRM 文件"""
+    logger.info("开始清理多余的 STRM 文件...")
+
+    deleted_count = 0
+    for root, _, files in os.walk(strm_path):
+        for file in files:
+            if file.endswith('.strm'):
+                full_path = os.path.abspath(os.path.join(root, file))
+                if full_path not in generated_files:
+                    try:
+                        os.remove(full_path)
+                        logger.debug(f"删除多余文件: {full_path}")
+                        deleted_count += 1
+                    except Exception as e:
+                        logger.error(f"删除文件失败 {full_path}: {e}")
+
+    logger.info(f"清理完成，删除了 {deleted_count} 个多余文件")
+    return deleted_count
+
+# ========================================
+# 主函数
+# ========================================
+def main():
+    """主执行函数"""
+    start_time = time.time()
+
+    try:
+        # 构建完整 URL
+        alist_url = f"http://{CONFIG['ALIST_HOST']}:{CONFIG['ALIST_PORT']}"
+        alist_file_url_prefix = f"{alist_url}/d{CONFIG['ALIST_115_MOUNT_PATH']}"
+        directory_tree_file = f"{alist_file_url_prefix}{CONFIG['ALIST_115_TREE_FILE']}"
+
+        logger.info(f"开始执行 STRM 文件生成任务")
+        logger.info(f"Alist URL: {alist_url}")
+        logger.info(f"目录树文件: {directory_tree_file}")
+
+        # 检查目录树文件
+        if directory_tree_file.startswith("http"):
+            output_file = os.path.join(CONFIG['STRM_SAVE_PATH'],
+                                     extract_filename_from_url(directory_tree_file))
+
+            # 如果配置了 guest 用户探测
+            if CONFIG['ALIST_115_TREE_FILE_FOR_GUEST']:
+                api_url_file_info = f"{alist_url}/api/fs/get"
+                response = fetch_file_info(api_url_file_info,
+                                         CONFIG['ALIST_115_TREE_FILE_FOR_GUEST'])
+                if response:
+                    modified, sha1 = extract_modified_and_sha1(response)
+                    if modified is None or sha1 is None:
+                        logger.error("无法获取文件信息，请检查 115 登录状态")
+                        return
+
+                    # 检查本地文件是否需要更新
+                    if os.path.isfile(output_file):
+                        local_sha1 = get_file_sha1(output_file)
+                        if local_sha1 == sha1:
+                            logger.info(f"文件未变化，跳过更新 (SHA1: {sha1})")
+                            return
+
+                download_with_redirects(directory_tree_file, output_file)
+            else:
+                download_with_redirects(directory_tree_file, output_file)
+        else:
+            output_file = directory_tree_file
+
+        # 验证文件是否存在
+        if not os.path.isfile(output_file):
+            logger.error(f"目录树文件不存在: {output_file}")
+            return
+
+        # 解析目录树
+        converted_file = os.path.splitext(output_file)[0] + '_converted.txt'
+        parse_directory_tree(output_file, converted_file)
+
+        # 生成 STRM 文件
+        generated_files = generate_strm_files(converted_file, CONFIG['STRM_SAVE_PATH'],
+                                              alist_file_url_prefix, CONFIG['EXCLUDE_OPTION'])
+
+        # 删除多余的文件
+        deleted_count = 0
+        if CONFIG['DELETE_ABSENT'] == 1:
+            deleted_count = delete_absent_files(CONFIG['STRM_SAVE_PATH'], generated_files)
+
+        # 清理临时文件
+        if os.path.exists(converted_file):
+            os.remove(converted_file)
+
+        # 计算执行时间
+        duration = time.time() - start_time
+        logger.info(f"✅ 任务完成！耗时: {duration:.2f}秒，"
+                  f"生成: {len(generated_files)} 个，删除: {deleted_count} 个")
+
+    except Exception as e:
+        logger.error(f"❌ 任务执行失败: {e}", exc_info=True)
+        raise
+
+if __name__ == "__main__":
+    main()
